@@ -183,6 +183,13 @@ fn run() -> std::io::Result<()> {
     // A reply the writer started answering while it still lingered on the
     // page: it stays visible while they write and is drunk with their ink.
     let mut pending_reply = BBox::empty();
+    // Basilisk-fang erase: hold the eraser still on one spot for 3s and the
+    // diary's memory dies. (origin x, origin y, press start) plus the radius
+    // of the warning ink already pooled at the stab point.
+    let mut stab: Option<(i32, i32, Instant)> = None;
+    let mut stab_pool: i32 = 0;
+    // Latest eraser contact this loop; None once the pen lifts or flips.
+    let mut eraser_at: Option<(i32, i32)> = None;
     let mut last_flush = Instant::now();
     // Takeover swaps are cheap and synchronous; qtfb needs coalescing.
     let flush_every = if takeover { Duration::from_millis(8) } else { Duration::from_millis(35) };
@@ -261,6 +268,7 @@ fn run() -> std::io::Result<()> {
                         pen_down = false;
                         user_ink.pen_up();
                         last_footstep = None;
+                        eraser_at = None;
                         if let State::Listening { ref mut last_pen } = state {
                             *last_pen = Some(Instant::now());
                         }
@@ -282,6 +290,7 @@ fn run() -> std::io::Result<()> {
                         pen_down = true;
                         let d = match s.tool {
                             pen::Tool::Pen => {
+                                eraser_at = None;
                                 let r = 2 + s.pressure * 3 / pen::MAX_PRESSURE;
                                 let mut d = user_ink.pen_point(&mut surf, s.x, s.y, r);
                                 if footprints && should_stamp_footstep(last_footstep, s.x, s.y) {
@@ -293,7 +302,17 @@ fn run() -> std::io::Result<()> {
                                 }
                                 d
                             }
-                            pen::Tool::Eraser => user_ink.erase_point(&mut surf, s.x, s.y, 22),
+                            pen::Tool::Eraser => {
+                                eraser_at = Some((s.x, s.y));
+                                // While the stab's warning ink pools, the tip
+                                // is a fang, not an eraser: don't erase (and
+                                // don't record an erase op for the memory).
+                                if stab_pool > 0 {
+                                    BBox::empty()
+                                } else {
+                                    user_ink.erase_point(&mut surf, s.x, s.y, 22)
+                                }
+                            }
                         };
                         if !d.is_empty() {
                             ink_dirty.add(d.x0, d.y0, 0);
@@ -359,6 +378,91 @@ fn run() -> std::io::Result<()> {
                 }
                 _ => {}
             }
+        }
+
+        // ---- basilisk-fang stab (hold the eraser still for 3s) ----
+        let stab_live = pen_down && matches!(state, State::Listening { .. });
+        match (stab, eraser_at, stab_live) {
+            (None, Some((x, y)), true) => stab = Some((x, y, Instant::now())),
+            (Some((sx, sy, t0)), Some((x, y)), true) => {
+                let (dx, dy) = (x - sx, y - sy);
+                if dx * dx + dy * dy > 20 * 20 {
+                    // Drifted: this is erasing, not stabbing. Reabsorb any
+                    // warning ink and re-arm at the new spot.
+                    if stab_pool > 0 {
+                        let mut blot = BBox::empty();
+                        blot.add(sx, sy, stab_pool + 2);
+                        for stage in 0..8 {
+                            ink::dissolve_pass(&mut surf, blot, stage, 8);
+                            let (bx, by, bw, bh) = blot.rect();
+                            disp.update(bx, by, bw, bh, true);
+                            std::thread::sleep(Duration::from_millis(45));
+                        }
+                    }
+                    stab = Some((x, y, Instant::now()));
+                    stab_pool = 0;
+                } else {
+                    let held = t0.elapsed();
+                    if held >= Duration::from_secs(3) {
+                        // The fang lands: ink gushes from the wound…
+                        eprintln!("riddle: basilisk fang — the diary's memory is erased");
+                        let (w, h) = (surf.w as i32, surf.h as i32);
+                        let maxr = {
+                            let fx = sx.max(w - sx);
+                            let fy = sy.max(h - sy);
+                            (((fx * fx + fy * fy) as f64).sqrt() as i32) + 2
+                        };
+                        for step in 1..=5 {
+                            flood_disc(&mut surf, sx, sy, maxr * step / 5);
+                            disp.update(0, 0, w, h, true);
+                            std::thread::sleep(Duration::from_millis(160));
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                        // …and drains away: a blank page, and no memory.
+                        if let Some(ref o) = oracle {
+                            o.erase();
+                        }
+                        surf.fill_rect(0, 0, surf.w, surf.h, WHITE);
+                        disp.full_refresh(surf.w, surf.h);
+                        user_ink.clear();
+                        pending_reply = BBox::empty();
+                        ink_dirty = BBox::empty();
+                        last_footstep = None;
+                        stab = None;
+                        stab_pool = 0;
+                        eraser_at = None;
+                        state = State::Listening { last_pen: None };
+                    } else if held >= Duration::from_secs(1) {
+                        // Warning ink pools at the stab point: the writer's
+                        // signal that the stab is registering — lift to abort.
+                        let ms = (held.as_millis() as i32 - 1000).clamp(0, 2000);
+                        let r = 10 + ms * 100 / 2000;
+                        if r > stab_pool {
+                            surf.stamp(sx, sy, r, BLACK);
+                            disp.update(sx - r, sy - r, 2 * r + 1, 2 * r + 1, true);
+                            stab_pool = r;
+                        }
+                    }
+                }
+            }
+            (Some((sx, sy, _)), _, _) => {
+                // Lifted (or the state moved on): abort, reabsorb the warning
+                // ink. Anything under the blot goes with it — the writer did
+                // press an eraser there.
+                if stab_pool > 0 {
+                    let mut blot = BBox::empty();
+                    blot.add(sx, sy, stab_pool + 2);
+                    for stage in 0..8 {
+                        ink::dissolve_pass(&mut surf, blot, stage, 8);
+                        let (bx, by, bw, bh) = blot.rect();
+                        disp.update(bx, by, bw, bh, true);
+                        std::thread::sleep(Duration::from_millis(45));
+                    }
+                }
+                stab = None;
+                stab_pool = 0;
+            }
+            _ => {}
         }
 
         // ---- coalesced ink flush ----
@@ -570,6 +674,22 @@ fn run() -> std::io::Result<()> {
     eprintln!("riddle: the diary closes");
     disp.terminate();
     Ok(())
+}
+
+/// One expanding pass of the stab flood: a solid black disc clipped to the
+/// page, drawn as row spans so a page-sized flood stays cheap.
+fn flood_disc(surf: &mut Surface, cx: i32, cy: i32, r: i32) {
+    let y0 = (cy - r).max(0);
+    let y1 = (cy + r).min(surf.h as i32 - 1);
+    for y in y0..=y1 {
+        let dy = y - cy;
+        let half = (((r * r - dy * dy) as f64).sqrt()) as i32;
+        let x0 = (cx - half).max(0);
+        let x1 = (cx + half).min(surf.w as i32 - 1);
+        for x in x0..=x1 {
+            surf.put_px(x, y, BLACK);
+        }
+    }
 }
 
 fn should_stamp_footstep(last: Option<(i32, i32)>, x: i32, y: i32) -> bool {

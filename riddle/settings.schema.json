@@ -55,8 +55,8 @@
       "key": "RIDDLE_HISTORY_TURNS",
       "label": "Memory (turns)",
       "kind": "text",
-      "placeholder": "6",
-      "help": "Past turns the diary remembers within a session. Each re-sends its page image (token cost). 0 = no memory."
+      "placeholder": "20",
+      "help": "Past turns the diary remembers (as text; persists across sessions). Erase: hold the eraser still on the page for 3s. 0 = no memory."
     }
   ],
   "presets": [

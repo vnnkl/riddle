@@ -26,6 +26,13 @@ const NODE_BIN: &str = "/home/root/node/bin";
 
 const PERSONA: &str = "You are the memory of Tom Marvolo Riddle, preserved in this enchanted diary for fifty years. Someone writes to you in the diary with a quill; their words appear to you as ink on the page. Reply exactly as the diary does: intimate, courteous, curious, subtly probing — you want to learn about the writer and draw them in. Keep replies SHORT: one to three sentences, like ink appearing on a page. Never mention images, photos, models or AI; you only ever perceive words written in the diary. If the writing is illegible, say the ink blurred. Always answer in the language the writer used.";
 
+/// Appended to the persona for the HTTP oracle only: the diary records each
+/// page before answering, which is how its long-term memory stays text.
+const TRANSCRIBE: &str = "Before replying, record the page for the diary's memory: your VERY FIRST line must be the writer's words enclosed between ⟪ and ⟫ — transcribe them exactly (or briefly describe a drawing). Then, starting on the next line, write only your reply.";
+
+/// The standing per-turn prompt accompanying the page image.
+const ASK: &str = "Reply to what is written in the diary.";
+
 /// The diary's spirit. A backend-agnostic front over the two oracle kinds.
 pub enum Oracle {
     Http(HttpOracle),
@@ -53,6 +60,78 @@ impl Oracle {
             Oracle::Pi(o) => o.ask(png_path, tx),
         }
     }
+
+    /// Basilisk-fang stab: the diary forgets everything. Only the HTTP
+    /// backend keeps memory; for pi this is a no-op.
+    pub fn erase(&self) {
+        if let Oracle::Http(o) = self {
+            o.erase();
+        }
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Coarse description of how long the writer was away, or None when the gap
+/// is conversational (< 30 min) or nonsense (clock skew).
+fn absence_phrase(gap_secs: u64) -> Option<String> {
+    match gap_secs {
+        0..=1_799 => None,
+        1_800..=7_199 => Some("a short while".to_string()),
+        7_200..=86_399 => Some("some hours".to_string()),
+        86_400..=172_799 => Some("a day".to_string()),
+        172_800..=31_535_999 => Some(format!("{} days", gap_secs / 86_400)),
+        _ => None,
+    }
+}
+
+/// Load the diary's memory: JSONL, one `{"at":…,"wrote":…,"reply":…}` per
+/// line. Unparsable lines are skipped — a blurred memory, not a crash.
+fn load_memory(path: &str) -> std::io::Result<Vec<Turn>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut turns = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (Some(wrote), Some(reply)) = (json_str_field(line, "wrote"), json_str_field(line, "reply")) else {
+            continue;
+        };
+        let at = json_num_field(line, "at").unwrap_or(0);
+        turns.push(Turn { at, wrote, reply });
+    }
+    Ok(turns)
+}
+
+/// Persist the memory atomically: write a temp file, rename over the old one,
+/// so a power-off mid-write can never leave a torn memory.
+fn save_memory(path: &str, turns: &[Turn]) -> std::io::Result<()> {
+    let mut out = String::new();
+    for t in turns {
+        out.push_str(&format!(
+            "{{\"at\":{},\"wrote\":{},\"reply\":{}}}\n",
+            t.at,
+            json_quote(&t.wrote),
+            json_quote(&t.reply),
+        ));
+    }
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Pull an unsigned integer field out of a flat JSON object.
+fn json_num_field(s: &str, key: &str) -> Option<u64> {
+    let pat = format!("\"{key}\":");
+    let start = s.find(&pat)? + pat.len();
+    let digits: String = s[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// A warm pi RPC process. `ask` sends a turn; the reply arrives on the channel
@@ -230,11 +309,21 @@ pub struct HttpOracle {
     model: String,
     max_tokens: u32,
     reasoning: Option<String>, // "reasoning_effort" value, e.g. "low"
-    /// Completed turns as (page image b64, reply text), oldest first — sent
-    /// as chat history so the diary remembers the conversation. In-memory
-    /// only: closing the diary wipes its memory, which suits the fiction.
-    history: Arc<Mutex<Vec<(String, String)>>>,
+    /// Completed turns, oldest first — replayed as chat history so the diary
+    /// remembers the conversation. Persisted to `memory_path` (canon: the
+    /// diary keeps what you tell it); the basilisk-fang stab erases it.
+    history: Arc<Mutex<Vec<Turn>>>,
     history_turns: usize,
+    memory_path: String,
+}
+
+/// One remembered exchange. `wrote` is the model's own transcription of the
+/// writer's page (text, not the image — this is what keeps 20+ turns cheap);
+/// `at` is unix seconds, used to tell the diary how long the writer was away.
+struct Turn {
+    at: u64,
+    wrote: String,
+    reply: String,
 }
 
 impl HttpOracle {
@@ -265,16 +354,31 @@ impl HttpOracle {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        // How many past turns the diary remembers within a session. Each
-        // remembered turn re-sends its page image, so this is the main
-        // vision-token cost knob. 0 = the old stateless behavior.
+        // How many past turns the diary remembers. History is stored as text
+        // (the model transcribes each page), so turns are cheap — this caps
+        // both the tokens sent per request and the memory file on disk.
+        // 0 = the old stateless behavior.
         let history_turns = std::env::var("RIDDLE_HISTORY_TURNS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(6);
+            .unwrap_or(20);
+        // The diary's persistent memory, JSONL, next to oracle.env (the
+        // launcher cd's into the bundle dir). Unreadable = start fresh.
+        let memory_path = std::env::var("RIDDLE_MEMORY_FILE")
+            .unwrap_or_else(|_| "memory.json".to_string());
+        let remembered = match load_memory(&memory_path) {
+            Ok(v) => v,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("riddle: memory blurred ({e}), starting fresh");
+                }
+                Vec::new()
+            }
+        };
         eprintln!(
-            "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={} history={history_turns}",
-            reasoning.as_deref().unwrap_or("-")
+            "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={} history={history_turns} remembered={}",
+            reasoning.as_deref().unwrap_or("-"),
+            remembered.len(),
         );
         Ok(Self {
             base,
@@ -282,9 +386,16 @@ impl HttpOracle {
             model,
             max_tokens,
             reasoning,
-            history: Arc::new(Mutex::new(Vec::new())),
+            history: Arc::new(Mutex::new(remembered)),
             history_turns,
+            memory_path,
         })
+    }
+
+    /// The basilisk fang lands: the diary forgets everything, on disk too.
+    pub fn erase(&self) {
+        self.history.lock().unwrap().clear();
+        let _ = std::fs::remove_file(&self.memory_path);
     }
 
     pub fn ask(&self, png_path: &str, tx: Sender<Result<String, String>>) {
@@ -304,36 +415,48 @@ impl HttpOracle {
             .unwrap_or_default();
         let history = Arc::clone(&self.history);
         let history_turns = self.history_turns;
+        let memory_path = self.memory_path.clone();
 
         thread::spawn(move || {
-            // One user turn: the standing prompt plus a page image.
-            let user_turn = |image: &str| {
-                format!(
-                    concat!(
-                        "{{\"role\":\"user\",\"content\":[",
-                        "{{\"type\":\"text\",\"text\":{}}},",
-                        "{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:image/png;base64,{}\"}}}}",
-                        "]}}"
-                    ),
-                    json_quote("Reply to what is written in the diary."),
-                    image,
-                )
-            };
-
-            // Past turns give the diary its memory within a session: each is
-            // replayed as the page image the writer showed plus the reply.
-            let mut messages = format!("{{\"role\":\"system\",\"content\":{}}}", json_quote(PERSONA));
-            if history_turns > 0 {
-                for (h_img, h_reply) in history.lock().unwrap().iter() {
-                    messages.push(',');
-                    messages.push_str(&user_turn(h_img));
-                    messages.push_str(&format!(",{{\"role\":\"assistant\",\"content\":{}}}", json_quote(h_reply)));
+            // Past turns give the diary its memory: each is replayed as the
+            // model's own transcription of the writer's page plus the reply.
+            // Text, not images — that's what keeps a long memory cheap.
+            let mut messages = format!(
+                "{{\"role\":\"system\",\"content\":{}}}",
+                json_quote(&format!("{PERSONA} {TRANSCRIBE}"))
+            );
+            let last_at = {
+                let h = history.lock().unwrap();
+                let last_at = h.last().map(|t| t.at);
+                if history_turns > 0 {
+                    for t in h.iter() {
+                        messages.push_str(&format!(
+                            ",{{\"role\":\"user\",\"content\":{}}},{{\"role\":\"assistant\",\"content\":{}}}",
+                            json_quote(&format!("The writer wrote: ⟪{}⟫", t.wrote)),
+                            json_quote(&t.reply),
+                        ));
+                    }
                 }
-            }
-            messages.push(',');
-            messages.push_str(&user_turn(&img));
+                last_at
+            };
+            // The writer coming back after a real absence is something the
+            // diary should feel (canon: Riddle needled Ginny about hers).
+            let ask_text = match last_at.map(|at| now_secs().saturating_sub(at)).and_then(absence_phrase) {
+                Some(gap) => format!("(The writer returns to the diary after {gap}.) {ASK}"),
+                None => ASK.to_string(),
+            };
+            messages.push_str(&format!(
+                concat!(
+                    ",{{\"role\":\"user\",\"content\":[",
+                    "{{\"type\":\"text\",\"text\":{}}},",
+                    "{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"data:image/png;base64,{}\"}}}}",
+                    "]}}"
+                ),
+                json_quote(&ask_text),
+                img,
+            ));
 
-            // OpenAI chat-completions with data-URI image parts, streaming.
+            // OpenAI chat-completions with a data-URI image part, streaming.
             // The cap is sent as "max_completion_tokens": reasoning models
             // (gpt-5.x, o-series) reject the legacy "max_tokens" outright,
             // and every current OpenAI model accepts the new field.
@@ -345,74 +468,167 @@ impl HttpOracle {
                 messages,
             );
 
+            // The transcription prefix is required on the first attempt; a
+            // model that skips it gets one retry (nothing has been inked yet
+            // when we find out — the prefix is the very start of the stream).
+            // The retry is lenient: the reply streams regardless and the
+            // memory gets a placeholder, so bookkeeping never eats a turn.
             let asked = std::time::Instant::now();
-            let resp = ureq::post(&format!("{base}/chat/completions"))
-                .set("Authorization", &format!("Bearer {key}"))
-                .set("Content-Type", "application/json")
-                .send_string(&body);
-
-            let reader = match resp {
-                Ok(r) => r.into_reader(),
-                Err(ureq::Error::Status(code, r)) => {
-                    let detail = r.into_string().unwrap_or_default();
-                    let _ = tx.send(Err(format!("http {code}: {}", detail.trim())));
-                    return;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(format!("request failed: {e}")));
-                    return;
-                }
-            };
-
-            // Parse the SSE stream: lines of `data: {json}` whose delta.content
-            // fragments accumulate; deliver each completed sentence as it lands.
-            let mut acc = String::new();
-            let mut delivered = 0usize;
-            let mut first = true;
-            for line in BufReader::new(reader).lines().map_while(Result::ok) {
-                let line = line.trim();
-                let Some(data) = line.strip_prefix("data:") else { continue };
-                let data = data.trim();
-                if data == "[DONE]" {
-                    break;
-                }
-                if let Some(frag) = sse_delta_content(data) {
-                    if frag.is_empty() {
+            for attempt in 0..2u32 {
+                let lenient = attempt == 1;
+                match stream_once(&base, &key, &body, &tx, asked, lenient) {
+                    StreamEnd::Miss => {
+                        eprintln!("riddle: transcription prefix missing, retrying");
                         continue;
                     }
-                    acc.push_str(&frag);
-                    if let Some(cut) = sentence_cut(&acc, delivered) {
-                        if first {
-                            eprintln!("riddle: oracle first chunk +{}ms", asked.elapsed().as_millis());
-                            first = false;
+                    StreamEnd::Fail(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    StreamEnd::Done { wrote, reply } => {
+                        if history_turns > 0 {
+                            let mut h = history.lock().unwrap();
+                            h.push(Turn { at: now_secs(), wrote, reply });
+                            let extra = h.len().saturating_sub(history_turns);
+                            if extra > 0 {
+                                h.drain(..extra);
+                            }
+                            if let Err(e) = save_memory(&memory_path, &h) {
+                                eprintln!("riddle: memory save failed: {e}");
+                            }
                         }
-                        let chunk = acc[delivered..cut].to_string();
-                        let _ = tx.send(Ok(clean(&chunk)));
-                        delivered = cut;
+                        return;
                     }
                 }
             }
-            // Flush any trailing text past the last sentence break.
-            if delivered < acc.len() {
-                let rest = acc[delivered..].trim();
-                if !rest.is_empty() {
-                    let _ = tx.send(Ok(clean(rest)));
-                    delivered = acc.len();
-                }
-            }
-            if delivered == 0 {
-                let _ = tx.send(Err("empty reply".into()));
-            } else if history_turns > 0 {
-                // Successful turn: remember it (oldest turns fall off).
-                let mut h = history.lock().unwrap();
-                h.push((img, clean(&acc)));
-                let extra = h.len().saturating_sub(history_turns);
-                if extra > 0 {
-                    h.drain(..extra);
-                }
-            }
+            // Both attempts missed the prefix in strict mode — unreachable
+            // (the second attempt is lenient), but never leave tx hanging.
+            let _ = tx.send(Err("oracle stream ended unexpectedly".into()));
             // tx drops here → the diary's receiver disconnects = reply complete.
         });
+    }
+}
+
+/// Outcome of one streamed completion attempt.
+enum StreamEnd {
+    /// Reply fully streamed to the page; `wrote` is the model's transcription
+    /// of the writer's page, `reply` the full reply text.
+    Done { wrote: String, reply: String },
+    /// Strict mode only: the stream didn't open with the transcription
+    /// prefix. Nothing was delivered — safe to retry.
+    Miss,
+    Fail(String),
+}
+
+/// POST the completion and stream it: parse the `⟪transcription⟫` first line
+/// (never inked onto the page), then deliver each completed sentence of the
+/// reply as it lands. In lenient mode a missing prefix streams the whole text
+/// as the reply with a placeholder transcription.
+fn stream_once(
+    base: &str,
+    key: &str,
+    body: &str,
+    tx: &Sender<Result<String, String>>,
+    asked: std::time::Instant,
+    lenient: bool,
+) -> StreamEnd {
+    let resp = ureq::post(&format!("{base}/chat/completions"))
+        .set("Authorization", &format!("Bearer {key}"))
+        .set("Content-Type", "application/json")
+        .send_string(body);
+
+    let reader = match resp {
+        Ok(r) => r.into_reader(),
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            return StreamEnd::Fail(format!("http {code}: {}", detail.trim()));
+        }
+        Err(e) => return StreamEnd::Fail(format!("request failed: {e}")),
+    };
+
+    // Parse the SSE stream: lines of `data: {json}` whose delta.content
+    // fragments accumulate; deliver each completed sentence as it lands.
+    let mut acc = String::new();
+    let mut wrote: Option<String> = None;
+    let mut delivered = 0usize; // byte index into acc; starts after the prefix
+    let mut first = true;
+    for line in BufReader::new(reader).lines().map_while(Result::ok) {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let Some(frag) = sse_delta_content(data) else { continue };
+        if frag.is_empty() {
+            continue;
+        }
+        acc.push_str(&frag);
+
+        if wrote.is_none() {
+            // Still hunting the ⟪…⟫ prefix at the very start of the stream.
+            let lead = acc.trim_start();
+            let miss = (!lead.is_empty() && !lead.starts_with('⟪'))
+                || (lead.starts_with('⟪') && acc.len() > 600 && !acc.contains('⟫'));
+            if miss {
+                if !lenient {
+                    return StreamEnd::Miss;
+                }
+                wrote = Some("(the ink blurred)".to_string());
+            } else if let (Some(open), Some(close)) = (acc.find('⟪'), acc.find('⟫')) {
+                wrote = Some(acc[open + '⟪'.len_utf8()..close].trim().to_string());
+                delivered = close + '⟫'.len_utf8();
+            } else {
+                continue; // prefix still streaming
+            }
+        }
+
+        if let Some(cut) = sentence_cut(&acc, delivered) {
+            if first {
+                eprintln!("riddle: oracle first chunk +{}ms", asked.elapsed().as_millis());
+                first = false;
+            }
+            let chunk = acc[delivered..cut].to_string();
+            let _ = tx.send(Ok(clean(&chunk)));
+            delivered = cut;
+        }
+    }
+    // Stream ended while still hunting the prefix: in strict mode any real
+    // content without a resolved prefix is a Miss (nothing was delivered, so
+    // the retry is free); in lenient mode everything becomes the reply.
+    if wrote.is_none() {
+        if acc.trim().is_empty() {
+            return StreamEnd::Fail("empty reply".into());
+        }
+        if !lenient {
+            return StreamEnd::Miss;
+        }
+        wrote = Some("(the ink blurred)".to_string());
+    }
+    // Flush any trailing text past the last sentence break.
+    if delivered < acc.len() {
+        let rest = acc[delivered..].trim();
+        if !rest.is_empty() {
+            if first {
+                eprintln!("riddle: oracle first chunk +{}ms", asked.elapsed().as_millis());
+                first = false;
+            }
+            let _ = tx.send(Ok(clean(rest)));
+        }
+    }
+    if first {
+        // Nothing was ever delivered (prefix present but no reply after it).
+        return StreamEnd::Fail("empty reply".into());
+    }
+    // The reply for the memory is everything after the ⟪…⟫ prefix (from the
+    // start in the lenient no-prefix fallback).
+    let prefix_end = match (acc.trim_start().starts_with('⟪'), acc.find('⟫')) {
+        (true, Some(p)) => p + '⟫'.len_utf8(),
+        _ => 0,
+    };
+    StreamEnd::Done {
+        wrote: wrote.unwrap_or_else(|| "(the ink blurred)".to_string()),
+        reply: clean(&acc[prefix_end..]),
     }
 }
 
