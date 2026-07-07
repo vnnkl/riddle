@@ -272,6 +272,11 @@ fn run() -> std::io::Result<()> {
     // A reply the writer started answering while it still lingered on the
     // page: it stays visible while they write and is drunk with their ink.
     let mut pending_reply = BBox::empty();
+    // The sketch strokes of the reply currently on the page (screen space).
+    // When the writer answers ON TOP of a sketch — a game move on Tom's board
+    // — these are replayed beneath their ink in the oracle snapshot, so the
+    // model sees the marks in place, not a lone X on white paper.
+    let mut last_sketch: Vec<Vec<(i32, i32)>> = Vec::new();
     // Basilisk-fang erase: hold the eraser still on one spot for 3s and the
     // diary's memory dies. (origin x, origin y, press start), the nominal
     // splat radius already inked, and the bbox of everything the splat drew.
@@ -517,6 +522,7 @@ fn run() -> std::io::Result<()> {
                         user_ink.clear();
                         ink_dirty = BBox::empty();
                         pending_reply = BBox::empty();
+                        last_sketch = Vec::new();
                         stab = None;
                         eraser_at = None;
                         state = State::Listening { last_pen: None };
@@ -604,9 +610,15 @@ fn run() -> std::io::Result<()> {
                         let plan = plan_reply(&font, &oracle_excuse("no oracle"), Some(y));
                         State::Replying { plan, next: Instant::now(), rx: None }
                     } else {
-                        if let Err(e) = user_ink.to_png(&surf, PNG_PATH) {
+                        // The sketch the writer answered on top of (if any)
+                        // goes beneath their ink; it is about to be drunk, so
+                        // it is no longer "on the page" afterwards.
+                        let beneath: &[Vec<(i32, i32)>] =
+                            if pending_reply.is_empty() { &[] } else { &last_sketch };
+                        if let Err(e) = user_ink.to_png(&surf, PNG_PATH, beneath) {
                             eprintln!("riddle: rasterize failed: {e}");
                         }
+                        last_sketch = Vec::new();
                         // Remember this page: strokes now (they're cleared
                         // after the drink), transcript/reply as they stream.
                         turn_id = std::time::SystemTime::now()
@@ -695,6 +707,7 @@ fn run() -> std::io::Result<()> {
                             match plan_drawing(&sketch, None) {
                                 Some(plan) => {
                                     turn_reply.push_str(&draw::serialize(&sketch));
+                                    last_sketch = plan.strokes.clone();
                                     State::Replying { plan, next: Instant::now(), rx: Some(rx) }
                                 }
                                 None => State::Thinking { rx, pulse, blot_on, since },
@@ -765,11 +778,12 @@ fn run() -> std::io::Result<()> {
                             // A sketch mid-reply: splice it in below the prose
                             // written so far, and keep the block in the reply
                             // record (only if it was actually drawn).
-                            if append_drawing(&mut plan, &sketch).is_some() {
+                            if let Some(placed) = append_drawing(&mut plan, &sketch) {
                                 if !turn_reply.is_empty() {
                                     turn_reply.push(' ');
                                 }
                                 turn_reply.push_str(&draw::serialize(&sketch));
+                                last_sketch.extend(placed);
                             }
                             false
                         }
@@ -937,6 +951,8 @@ fn run() -> std::io::Result<()> {
                     disp.update(x, y, w, h, true);
                     if stage + 1 >= STAGES {
                         disp.full_refresh(surf.w, surf.h);
+                        // Whatever sketch the reply carried has left the page.
+                        last_sketch = Vec::new();
                         State::Listening { last_pen: None }
                     } else {
                         State::FadingReply { stage: stage + 1, next: Instant::now() + Duration::from_millis(80), region }

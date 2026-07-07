@@ -125,19 +125,41 @@ impl Ink {
     /// the oracle sees. Erases already edit the stroke model (`forget_near`),
     /// so the replay is faithful to the visible ink. `surf` is only consulted
     /// for the page dimensions.
-    pub fn to_png(&self, surf: &Surface, path: &str) -> std::io::Result<()> {
+    ///
+    /// `beneath`: strokes replayed UNDER the writer's ink — the sketch the
+    /// writer answered on top of (a game board Tom drew). Without it, an X
+    /// drawn onto a lingering board would reach the oracle as a lone X on
+    /// white paper, and the model could never tell which cell was meant.
+    pub fn to_png(
+        &self,
+        surf: &Surface,
+        path: &str,
+        beneath: &[Vec<(i32, i32)>],
+    ) -> std::io::Result<()> {
         if self.bbox.is_empty() {
             return Err(std::io::Error::other("no ink"));
         }
-        let (bx, by, bw, bh) = self.bbox.rect();
+        // Crop to the union of the writer's ink and whatever lies beneath it.
+        let mut bb = self.bbox;
+        for stroke in beneath {
+            for &(x, y) in stroke {
+                bb.add(x, y, 4);
+            }
+        }
+        let (bx, by, bw, bh) = bb.rect();
         let x0 = (bx - 20).max(0) as usize;
         let y0 = (by - 20).max(0) as usize;
         let x1 = ((bx + bw + 20) as usize).min(surf.w);
         let y1 = ((by + bh + 20) as usize).min(surf.h);
         let (cw, ch) = (x1 - x0, y1 - y0);
 
-        // Full-resolution replay of the writer's ink on a white page crop.
+        // Full-resolution replay on a white page crop: the sketch beneath
+        // first (the reply pen's width), the writer's ink over it.
         let mut page = vec![255u8; cw * ch];
+        for stroke in beneath {
+            let pts: Vec<(i32, i32, i32)> = stroke.iter().map(|&(x, y)| (x, y, 2)).collect();
+            replay_stroke(&mut page, cw, ch, x0 as i32, y0 as i32, &pts);
+        }
         for stroke in self.strokes.iter().chain(std::iter::once(&self.current)) {
             replay_stroke(&mut page, cw, ch, x0 as i32, y0 as i32, stroke);
         }
@@ -299,7 +321,7 @@ mod tests {
         s.stamp(110, 115, 8, BLACK);
 
         let path = std::env::temp_dir().join("riddle-ink-test.png");
-        ink.to_png(&s, path.to_str().unwrap()).unwrap();
+        ink.to_png(&s, path.to_str().unwrap(), &[]).unwrap();
 
         let dec = png::Decoder::new(std::fs::File::open(&path).unwrap());
         let mut reader = dec.read_info().unwrap();
@@ -319,6 +341,39 @@ mod tests {
         // And the real stroke IS there.
         let (sx, sy) = ((110 - (bx - 20)) as usize / f, (100 - (by - 20)) as usize / f);
         assert!(img[sy * w + sx] < 60, "the writer's ink is missing from the snapshot");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn to_png_replays_the_sketch_beneath_the_ink() {
+        let (_buf, mut s) = surf();
+        let mut ink = Ink::new();
+        // The writer's mark: a short stroke.
+        for x in (150..=170).step_by(5) {
+            ink.pen_point(&mut s, x, 160, 3);
+        }
+        ink.pen_up();
+        // The board beneath: a long line far outside the ink's own bbox.
+        let board: Vec<Vec<(i32, i32)>> = vec![(60..=300).step_by(4).map(|x| (x, 100)).collect()];
+
+        let path = std::env::temp_dir().join("riddle-ink-beneath-test.png");
+        ink.to_png(&s, path.to_str().unwrap(), &board).unwrap();
+
+        let dec = png::Decoder::new(std::fs::File::open(&path).unwrap());
+        let mut reader = dec.read_info().unwrap();
+        let mut img = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut img).unwrap();
+        let (w, h) = (info.width as usize, info.height as usize);
+        let f = 2;
+        // Crop origin follows the UNION bbox (board starts at x=60-4, y=100-4,
+        // minus the 20px pad), so the board line must be inside and inked.
+        let (cx0, cy0) = (60 - 4 - 20, 100 - 4 - 20);
+        let (bx, by) = ((180 - cx0) as usize / f, (100 - cy0) as usize / f);
+        assert!(by < h && bx < w, "board should fall inside the crop ({bx},{by} vs {w}x{h})");
+        assert!(img[by * w + bx] < 60, "the sketch beneath is missing (luma {})", img[by * w + bx]);
+        // The writer's own ink is there too.
+        let (sx, sy) = ((160 - cx0) as usize / f, (160 - cy0) as usize / f);
+        assert!(img[sy * w + sx] < 60, "the writer's ink is missing");
         let _ = std::fs::remove_file(&path);
     }
 
